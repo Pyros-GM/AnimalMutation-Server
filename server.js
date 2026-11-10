@@ -8,6 +8,11 @@
 //     {"t":"hit","to":id,"d":dmg,"p":poisonDps,"pd":poisonSecs,"s":stunSecs,"sl":[slowFrac,secs],"kb":[x,y,z]}
 //     {"t":"fx","k":"kind","n":"Skill Name","c":"#rrggbb","r":radius}
 //     {"t":"died"}
+//   shared enemies (each regular enemy is run by one player's game, its owner):
+//     {"t":"en","m":map,"list":[{k,t,l,p,r,hp,mh,ak}, ...]}   owner -> others on that map
+//     {"t":"ehit","to":ownerId,"k":key,"d":..,"p":..,"pd":..,"s":..,"kb":[..],"kd":..,"db":[name,a,b]}
+//     {"t":"pvehit","to":playerId,"d":dmg,"k":key}           owner's enemy bit another player
+//     {"t":"edie","k":key,"lv":level,"xb":xpBase,"hit":[ids]}
 //   server -> client
 //     {"t":"welcome","id":3,"players":[{id,name,p,r,f,l,d}, ...]}
 //     {"t":"join","id":4,"name":"Kiwi"}
@@ -25,7 +30,8 @@ const MAX_PLAYERS = 32;
 const TICK_MS = 100;
 const IDLE_TIMEOUT_MS = 30000;
 const HIT_RANGE = 45;          // generous: positions are 100 ms old
-const MAX_HITS_PER_SEC = 40;
+const MAX_HITS_PER_SEC = 120;   // hits + enemy hits + debuffs, per player
+const MAX_ENEMIES = 40;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 let nextId = 1;
@@ -59,7 +65,7 @@ server.on("upgrade", (req, socket) => {
   }
 
   const id = nextId++;
-  const pl = { socket, id, name: "", p: [0, 0, 0], r: 0, f: "", l: 1, d: false, hp: 100, mh: 100, v: true, h: false, hello: false, lastHitBy: 0, lastHitAt: 0, hitWin: 0, hitCount: 0, last: Date.now(), buf: Buffer.alloc(0) };
+  const pl = { socket, id, name: "", p: [0, 0, 0], r: 0, f: "", l: 1, d: false, hp: 100, mh: 100, v: true, h: false, m: 0, a: false, hello: false, lastHitBy: 0, lastHitAt: 0, hitWin: 0, hitCount: 0, last: Date.now(), buf: Buffer.alloc(0) };
   players.set(id, pl);
 
   socket.on("data", (chunk) => {
@@ -101,13 +107,14 @@ function onMessage(pl, text) {
     if (Number.isFinite(m.mh)) pl.mh = Math.round(m.mh);
     if (typeof m.v === "boolean") pl.v = m.v;
     pl.h = !!m.h;
+    if (Number.isFinite(m.m)) pl.m = m.m | 0;
+    pl.a = !!m.a;
   } else if (m.t === "hit" && pl.hello) {
     const tgt = players.get(m.to | 0);
     if (!tgt || !tgt.hello || tgt === pl || !pl.v || !tgt.v || pl.d || tgt.d) return;
     if (dist(pl.p, tgt.p) > HIT_RANGE) return;
     const now = Date.now();
-    if (now - pl.hitWin > 1000) { pl.hitWin = now; pl.hitCount = 0; }
-    if (++pl.hitCount > MAX_HITS_PER_SEC) return;
+    if (!rate(pl)) return;
     const out = { t: "hit", from: pl.id, d: num(m.d, 0, 5000) };
     if (m.p) { out.p = num(m.p, 0, 500); out.pd = num(m.pd, 0, 15); }
     if (m.s) out.s = num(m.s, 0, 3);
@@ -116,6 +123,31 @@ function onMessage(pl, text) {
     tgt.lastHitBy = pl.id;
     tgt.lastHitAt = now;
     send(tgt, out);
+  } else if (m.t === "en" && pl.hello && Array.isArray(m.list)) {
+    // Owner's enemies: only to players on the same map.
+    const list = m.list.slice(0, MAX_ENEMIES).filter((e) => e && typeof e === "object").map((e) => ({
+      k: e.k | 0, t: String(e.t || "").slice(0, 24), l: e.l | 0,
+      p: Array.isArray(e.p) && e.p.length === 3 ? e.p.map((v) => num(v, -1e4, 1e4)) : [0, 0, 0],
+      r: num(e.r, -100, 100), hp: num(e.hp, 0, 1e6), mh: num(e.mh, 1, 1e6), ak: e.ak | 0,
+    }));
+    sameMap(pl, { t: "en", id: pl.id, m: pl.m, list });
+  } else if (m.t === "ehit" && pl.hello) {
+    const owner = players.get(m.to | 0);
+    if (!owner || !owner.hello || owner === pl || owner.m !== pl.m || !rate(pl)) return;
+    const out = { t: "ehit", from: pl.id, k: m.k | 0, d: num(m.d, 0, 5000) };
+    if (m.p) { out.p = num(m.p, 0, 500); out.pd = num(m.pd, 0, 15); }
+    if (m.s) out.s = num(m.s, 0, 3);
+    if (Array.isArray(m.kb) && m.kb.length === 3) { out.kb = m.kb.map((v) => num(v, -40, 40)); out.kd = num(m.kd, 0, 2); }
+    if (Array.isArray(m.db) && m.db.length >= 2 && m.db.length <= 3 && typeof m.db[0] === "string")
+      out.db = [m.db[0].slice(0, 20), ...m.db.slice(1).map((v) => num(v, 0, 30))];
+    send(owner, out);
+  } else if (m.t === "pvehit" && pl.hello) {
+    const tgt = players.get(m.to | 0);
+    if (!tgt || !tgt.hello || tgt === pl || tgt.m !== pl.m || tgt.d || !rate(pl)) return;
+    send(tgt, { t: "pvehit", from: pl.id, k: m.k | 0, d: num(m.d, 0, 2000) });
+  } else if (m.t === "edie" && pl.hello) {
+    const hit = Array.isArray(m.hit) ? m.hit.slice(0, 32).map((v) => v | 0) : [];
+    sameMap(pl, { t: "edie", id: pl.id, k: m.k | 0, lv: m.lv | 0, xb: num(m.xb, 0, 1e5), hit });
   } else if (m.t === "fx" && pl.hello) {
     broadcast({ t: "fx", id: pl.id, k: String(m.k || "").slice(0, 24), n: String(m.n || "").slice(0, 32), c: String(m.c || "").slice(0, 10), r: num(m.r, 0, 30) }, pl);
   } else if (m.t === "died" && pl.hello) {
@@ -124,6 +156,18 @@ function onMessage(pl, text) {
     broadcast({ t: "kill", id: pl.id, by: killer ? killer.id : -1, name: pl.name, byName: killer ? killer.name : "" });
     console.log(`kill #${pl.id} ${pl.name} by ${killer ? killer.name : "the wild"}`);
   }
+}
+
+// Per-player cap on hit-type messages.
+function rate(pl) {
+  const now = Date.now();
+  if (now - pl.hitWin > 1000) { pl.hitWin = now; pl.hitCount = 0; }
+  return ++pl.hitCount <= MAX_HITS_PER_SEC;
+}
+
+function sameMap(pl, obj) {
+  const txt = JSON.stringify(obj);
+  for (const o of players.values()) if (o !== pl && o.hello && o.m === pl.m) sendRaw(o.socket, txt);
 }
 
 function num(v, lo, hi) {
@@ -135,7 +179,7 @@ function dist(a, b) {
 }
 
 function pub(o, withName) {
-  const s = { id: o.id, p: o.p, r: o.r, f: o.f, l: o.l, d: o.d, hp: o.hp, mh: o.mh, v: o.v, h: o.h };
+  const s = { id: o.id, p: o.p, r: o.r, f: o.f, l: o.l, d: o.d, hp: o.hp, mh: o.mh, v: o.v, h: o.h, m: o.m, a: o.a };
   if (withName) s.name = o.name;
   return s;
 }
