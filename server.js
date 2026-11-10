@@ -4,12 +4,18 @@
 // Protocol (JSON text frames):
 //   client -> server
 //     {"t":"hello","name":"Rex","form":"hatchling"}
-//     {"t":"state","p":[x,y,z],"r":yaw,"f":"form_id","l":level,"d":dead}
+//     {"t":"state","p":[x,y,z],"r":yaw,"f":"form_id","l":level,"d":dead,"hp":hp,"mh":maxHp,"v":pvpOn,"h":hidden}
+//     {"t":"hit","to":id,"d":dmg,"p":poisonDps,"pd":poisonSecs,"s":stunSecs,"sl":[slowFrac,secs],"kb":[x,y,z]}
+//     {"t":"fx","k":"kind","n":"Skill Name","c":"#rrggbb","r":radius}
+//     {"t":"died"}
 //   server -> client
 //     {"t":"welcome","id":3,"players":[{id,name,p,r,f,l,d}, ...]}
 //     {"t":"join","id":4,"name":"Kiwi"}
 //     {"t":"leave","id":4}
-//     {"t":"states","list":[{id,p,r,f,l,d}, ...]}      (10 times a second)
+//     {"t":"states","list":[{id,p,r,f,l,d,hp,mh,v,h}, ...]}      (10 times a second)
+//     {"t":"hit","from":id, ...same fields as above}       (only to the target; both must have PvP on)
+//     {"t":"fx","id":id,"k":..,"n":..,"c":..,"r":..}
+//     {"t":"kill","id":victim,"by":killer or -1,"name":..,"byName":..}
 
 const http = require("http");
 const crypto = require("crypto");
@@ -18,6 +24,8 @@ const PORT = process.env.PORT || 10000;
 const MAX_PLAYERS = 32;
 const TICK_MS = 100;
 const IDLE_TIMEOUT_MS = 30000;
+const HIT_RANGE = 45;          // generous: positions are 100 ms old
+const MAX_HITS_PER_SEC = 40;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 let nextId = 1;
@@ -51,7 +59,7 @@ server.on("upgrade", (req, socket) => {
   }
 
   const id = nextId++;
-  const pl = { socket, id, name: "", p: [0, 0, 0], r: 0, f: "", l: 1, d: false, hello: false, last: Date.now(), buf: Buffer.alloc(0) };
+  const pl = { socket, id, name: "", p: [0, 0, 0], r: 0, f: "", l: 1, d: false, hp: 100, mh: 100, v: true, h: false, hello: false, lastHitBy: 0, lastHitAt: 0, hitWin: 0, hitCount: 0, last: Date.now(), buf: Buffer.alloc(0) };
   players.set(id, pl);
 
   socket.on("data", (chunk) => {
@@ -89,11 +97,45 @@ function onMessage(pl, text) {
     if (typeof m.f === "string") pl.f = m.f.slice(0, 48);
     if (Number.isFinite(m.l)) pl.l = m.l | 0;
     pl.d = !!m.d;
+    if (Number.isFinite(m.hp)) pl.hp = Math.round(m.hp);
+    if (Number.isFinite(m.mh)) pl.mh = Math.round(m.mh);
+    if (typeof m.v === "boolean") pl.v = m.v;
+    pl.h = !!m.h;
+  } else if (m.t === "hit" && pl.hello) {
+    const tgt = players.get(m.to | 0);
+    if (!tgt || !tgt.hello || tgt === pl || !pl.v || !tgt.v || pl.d || tgt.d) return;
+    if (dist(pl.p, tgt.p) > HIT_RANGE) return;
+    const now = Date.now();
+    if (now - pl.hitWin > 1000) { pl.hitWin = now; pl.hitCount = 0; }
+    if (++pl.hitCount > MAX_HITS_PER_SEC) return;
+    const out = { t: "hit", from: pl.id, d: num(m.d, 0, 5000) };
+    if (m.p) { out.p = num(m.p, 0, 500); out.pd = num(m.pd, 0, 15); }
+    if (m.s) out.s = num(m.s, 0, 3);
+    if (Array.isArray(m.sl) && m.sl.length === 2) out.sl = [num(m.sl[0], 0, 0.9), num(m.sl[1], 0, 6)];
+    if (Array.isArray(m.kb) && m.kb.length === 3) out.kb = m.kb.map((v) => num(v, -40, 40));
+    tgt.lastHitBy = pl.id;
+    tgt.lastHitAt = now;
+    send(tgt, out);
+  } else if (m.t === "fx" && pl.hello) {
+    broadcast({ t: "fx", id: pl.id, k: String(m.k || "").slice(0, 24), n: String(m.n || "").slice(0, 32), c: String(m.c || "").slice(0, 10), r: num(m.r, 0, 30) }, pl);
+  } else if (m.t === "died" && pl.hello) {
+    const killer = pl.lastHitBy && Date.now() - pl.lastHitAt < 15000 ? players.get(pl.lastHitBy) : null;
+    pl.lastHitBy = 0;
+    broadcast({ t: "kill", id: pl.id, by: killer ? killer.id : -1, name: pl.name, byName: killer ? killer.name : "" });
+    console.log(`kill #${pl.id} ${pl.name} by ${killer ? killer.name : "the wild"}`);
   }
 }
 
+function num(v, lo, hi) {
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : 0;
+}
+
+function dist(a, b) {
+  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+}
+
 function pub(o, withName) {
-  const s = { id: o.id, p: o.p, r: o.r, f: o.f, l: o.l, d: o.d };
+  const s = { id: o.id, p: o.p, r: o.r, f: o.f, l: o.l, d: o.d, hp: o.hp, mh: o.mh, v: o.v, h: o.h };
   if (withName) s.name = o.name;
   return s;
 }
