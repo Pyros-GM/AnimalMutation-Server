@@ -1,1 +1,13 @@
-{"name":"animal-mutation-server","version":"1.0.0","description":"Shared-world multiplayer relay for Animal Mutation (Godot)","main":"server.js","scripts":{"start":"node server.js"},"engines":{"node":">=18"},"license":"MIT"}
+{
+  "name": "animal-mutation-server",
+  "version": "1.0.0",
+  "description": "Shared-world multiplayer relay for Animal Mutation (Godot)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
