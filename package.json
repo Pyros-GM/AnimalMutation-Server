@@ -1,6 +1,6 @@
 {
   "name": "animal-mutation-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shared-world multiplayer relay for Animal Mutation (Godot)",
   "main": "server.js",
   "scripts": {

@@ -9,7 +9,7 @@
 //     {"t":"fx","k":"kind","n":"Skill Name","c":"#rrggbb","r":radius}
 //     {"t":"died"}
 //   shared enemies (each regular enemy is run by one player's game, its owner):
-//     {"t":"en","m":map,"list":[{k,t,l,p,r,hp,mh,ak}, ...]}   owner -> others on that map
+//     {"t":"en","m":map,"list":[{k,t,l,p,r,hp,mh,ak,v}, ...]} owner -> others on that map (v = variant, optional)
 //     {"t":"ehit","to":ownerId,"k":key,"d":..,"p":..,"pd":..,"s":..,"kb":[..],"kd":..,"db":[name,a,b]}
 //     {"t":"pvehit","to":playerId,"d":dmg,"k":key}           owner's enemy bit another player
 //     {"t":"edie","k":key,"lv":level,"xb":xpBase,"hit":[ids]}
@@ -18,7 +18,9 @@
 //     {"t":"join","id":4,"name":"Kiwi"}
 //     {"t":"leave","id":4}
 //     {"t":"states","list":[{id,p,r,f,l,d,hp,mh,v,h}, ...]}      (10 times a second)
-//     {"t":"hit","from":id, ...same fields as above}       (only to the target; both must have PvP on)
+//     {"t":"hit","from":id, ...same fields as above}       (only to the target; both must have PvP on,
+//                                                            be on the same map, outside the safe zones,
+//                                                            and within the PvP level gap — see pvpAllowed)
 //     {"t":"fx","id":id,"k":..,"n":..,"c":..,"r":..}
 //     {"t":"kill","id":victim,"by":killer or -1,"name":..,"byName":..}
 
@@ -33,6 +35,45 @@ const HIT_RANGE = 45;          // generous: positions are 100 ms old
 const MAX_HITS_PER_SEC = 120;   // hits + enemy hits + debuffs, per player
 const MAX_ENEMIES = 40;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+// ---------------- PvP limits (mirror the game's gameplay_rules.gd / world.gd) ----------------
+// No PvP within SAFE_R metres of a map's centre or of its passage mouths, and none between players
+// more than PVP_LEVEL_GAP levels apart unless both are PVP_FREE_LEVEL or higher.
+const SAFE_R = 24;
+const PVP_LEVEL_GAP = 10;
+const PVP_FREE_LEVEL = 50;
+// The 9 maps' grid cells, in the game's map index order (world.gd MAPS).
+const MAP_CELLS = [[0, 0], [1, 0], [0, 1], [2, 0], [1, 1], [0, 2], [2, 1], [1, 2], [2, 2]];
+// Passage mouths sit this far from the centre (HALF 165 - ARRIVE_IN 12); grid +y is the -z wall.
+const PASSAGE_IN = 153;
+// Enemy variants the game knows (enemy.gd VARIANTS; alphas aren't shared).
+const VARIANTS = new Set(["albino", "giant", "venomous"]);
+
+const safeCache = new Map();
+function safePoints(m) {
+  if (safeCache.has(m)) return safeCache.get(m);
+  const pts = [[0, 0]];
+  const cell = MAP_CELLS[m];
+  if (cell) {
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const has = MAP_CELLS.some(([x, y]) => x === cell[0] + dx && y === cell[1] + dy);
+      if (has) pts.push([dx * PASSAGE_IN, -dy * PASSAGE_IN]);
+    }
+  }
+  safeCache.set(m, pts);
+  return pts;
+}
+
+function inSafeZone(m, p) {
+  return safePoints(m).some(([x, z]) => Math.hypot(p[0] - x, p[2] - z) < SAFE_R);
+}
+
+function pvpAllowed(a, b) {
+  if (a.m !== b.m) return false;
+  if (inSafeZone(a.m, a.p) || inSafeZone(b.m, b.p)) return false;
+  if (a.l >= PVP_FREE_LEVEL && b.l >= PVP_FREE_LEVEL) return true;
+  return Math.abs(a.l - b.l) <= PVP_LEVEL_GAP;
+}
 
 let nextId = 1;
 const players = new Map(); // id -> {socket, name, p, r, f, l, d, last, buf}
@@ -112,7 +153,7 @@ function onMessage(pl, text) {
   } else if (m.t === "hit" && pl.hello) {
     const tgt = players.get(m.to | 0);
     if (!tgt || !tgt.hello || tgt === pl || !pl.v || !tgt.v || pl.d || tgt.d) return;
-    if (dist(pl.p, tgt.p) > HIT_RANGE) return;
+    if (!pvpAllowed(pl, tgt) || dist(pl.p, tgt.p) > HIT_RANGE) return;
     const now = Date.now();
     if (!rate(pl)) return;
     const out = { t: "hit", from: pl.id, d: num(m.d, 0, 5000) };
@@ -129,6 +170,7 @@ function onMessage(pl, text) {
       k: e.k | 0, t: String(e.t || "").slice(0, 24), l: e.l | 0,
       p: Array.isArray(e.p) && e.p.length === 3 ? e.p.map((v) => num(v, -1e4, 1e4)) : [0, 0, 0],
       r: num(e.r, -100, 100), hp: num(e.hp, 0, 1e6), mh: num(e.mh, 1, 1e6), ak: e.ak | 0,
+      ...(VARIANTS.has(e.v) ? { v: e.v } : {}),
     }));
     sameMap(pl, { t: "en", id: pl.id, m: pl.m, list });
   } else if (m.t === "ehit" && pl.hello) {
